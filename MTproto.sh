@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================
-# 一键安装 MTProto Proxy（适配受限 VPS / 面板环境）
+# 一键部署 MTProto Proxy
 # =================================================
 
 set -e
@@ -24,18 +24,10 @@ fi
 # 用户输入
 # -------------------------------
 read -p "请输入你的域名（用于 Telegram 代理，如 proxy.example.com）: " DOMAIN
-read -p "请输入 Nginx 监听端口（默认 443，可修改为高端口测试）: " PORT
+read -p "请输入 Nginx 监听端口（默认 443，可修改为高端端口测试）: " PORT
 PORT=${PORT:-443}
 
 green "🚀 开始部署 MTProto Proxy …"
-
-# -------------------------------
-# 安装依赖
-# -------------------------------
-green "➤ 安装依赖 Python3、pip、Nginx …"
-apt update
-apt install -y python3 python3-pip curl unzip git nginx
-pip3 install --upgrade pycryptodome uvloop
 
 # -------------------------------
 # 创建后端目录
@@ -152,4 +144,4 @@ green "👉 Telegram 代理链接:"
 echo "tg://proxy?server=$DOMAIN&port=$PORT&secret=dd$SECRET"
 green "━━━━━━━━━━━━━━━━━━━━━━━━"
 green "查看后端日志: tail -f /opt/mtproto/mtproto.log"
-yellow "⚠️ 如果 443 无法监听，请尝试使用高端口"
+yellow "⚠️ 如果 443 无法监听，请尝试使用高端端口"
