@@ -1,6 +1,17 @@
 #!/bin/bash
 # =================================================
+# 一键安装 MTProto 功能面板 (sb)
+# =================================================
+
+set -e
+
+echo "⚡ 正在生成 sb 面板脚本并设置 alias..."
+
+sudo bash -c 'cat > /usr/local/bin/sb <<'"'"'EOF'"'"'
+#!/bin/bash
+# =================================================
 # MTProto 功能面板 (sb 命令调用)
+# 后端服务强制后台保持运行
 # =================================================
 
 set -e
@@ -10,10 +21,6 @@ yellow() { echo -e "\033[33m$1\033[0m"; }
 red() { echo -e "\033[31m$1\033[0m"; }
 
 NODE_INFO_FILE="/opt/mtproto/node_info"
-
-# -------------------------------
-# 功能函数
-# -------------------------------
 
 install_dependencies() {
     green "⚡ 安装依赖..."
@@ -27,7 +34,6 @@ create_node() {
     mkdir -p /opt/mtproto
     DOMAIN=$(curl -s https://api.ipify.org)
     green "🌐 检测到 VPS 公网 IP: $DOMAIN"
-
     used_ports=()
     [[ -f "$NODE_INFO_FILE" ]] && used_ports=($(awk -F= '/PORT/ {print $2}' $NODE_INFO_FILE))
     while true; do
@@ -37,27 +43,24 @@ create_node() {
         fi
     done
     green "⚡ 选择可用端口: $PORT"
-
     SECRET=$(openssl rand -hex 16)
     green "🔑 dd-secret: dd$SECRET"
-
     echo "PORT=$PORT" > $NODE_INFO_FILE
     echo "SECRET=dd$SECRET" >> $NODE_INFO_FILE
     echo "DOMAIN=$DOMAIN" >> $NODE_INFO_FILE
-
-    cat <<EOF >/opt/mtproto/config.py
+    cat <<CONFIG >/opt/mtproto/config.py
 PORT = $PORT
 USERS = {"dd$SECRET": 100}
 DEBUG = False
 TG_DOMAIN = "$DOMAIN"
-EOF
-
+CONFIG
     green "✅ 节点创建完成"
 }
 
 start_backend() {
-    green "⚡ 启动 MTProto 后端..."
-    cat <<EOF >/etc/systemd/system/mtproto.service
+    green "⚡ 启动 MTProto 后端（systemd 强制后台运行）..."
+    mkdir -p /opt/mtproto
+    cat <<SERVICE >/etc/systemd/system/mtproto.service
 [Unit]
 Description=官方 MTProto Proxy
 After=network.target
@@ -73,35 +76,31 @@ StandardError=file:/opt/mtproto/mtproto.log
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SERVICE
 
     systemctl daemon-reload
     systemctl enable mtproto.service
-    systemctl start mtproto.service
-    green "✅ MTProto 后端已启动"
+    systemctl restart mtproto.service
+    green "✅ MTProto 后端已启动并保持后台运行"
 }
 
 start_monitor() {
-    green "⚡ 启动后台检测..."
-    cat <<'EOF' >/opt/mtproto/mtproto_monitor.sh
+    green "⚡ 启动后台检测脚本..."
+    cat <<'MONITOR' >/opt/mtproto/mtproto_monitor.sh
 #!/bin/bash
 NODE_INFO_FILE="/opt/mtproto/node_info"
 DETECT_INTERVAL=15
-TELEGRAM_DCS=("149.154.167.50" "149.154.167.91" "149.154.167.92" "173.240.5.253")
 PORTS_TO_TRY=()
-
 check_port() {
     local host=$1
     local port=$2
     timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1 && return 0 || return 1
 }
-
 if [[ ! -f "$NODE_INFO_FILE" ]]; then exit 1; fi
 source $NODE_INFO_FILE
 PORTS_TO_TRY=($PORT 443 80 25 110)
-
 while true; do
-    systemctl is-active --quiet mtproto.service || systemctl start mtproto.service
+    systemctl is-active --quiet mtproto.service || systemctl restart mtproto.service
     PORT_OK=0
     for p in "${PORTS_TO_TRY[@]}"; do
         if check_port $DOMAIN $p; then
@@ -112,11 +111,11 @@ while true; do
     done
     sleep $DETECT_INTERVAL
 done
-EOF
+MONITOR
 
     chmod +x /opt/mtproto/mtproto_monitor.sh
 
-    cat <<EOF >/etc/systemd/system/mtproto-monitor.service
+    cat <<SERVICE >/etc/systemd/system/mtproto-monitor.service
 [Unit]
 Description=MTProto 后端检测与自愈
 After=network.target mtproto.service
@@ -132,12 +131,12 @@ StandardError=file:/opt/mtproto/mtproto_monitor.log
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SERVICE
 
     systemctl daemon-reload
     systemctl enable mtproto-monitor.service
-    systemctl start mtproto-monitor.service
-    green "✅ 后台检测已启动"
+    systemctl restart mtproto-monitor.service
+    green "✅ 后台检测已启动并保持运行"
 }
 
 show_info() {
@@ -148,9 +147,18 @@ show_info() {
     source $NODE_INFO_FILE
     green "⚡ 当前节点信息:"
     echo "🌐 域名/IP: $DOMAIN"
-    echo "🔑 dd-secret: $SECRET"
     echo "⚡ 端口: $PORT"
-    yellow "Telegram 链接: tg://proxy?server=$DOMAIN&port=$PORT&secret=$SECRET"
+    if systemctl is-active --quiet mtproto.service; then
+        green "✅ 后端服务运行中"
+    else
+        red "❌ 后端服务未运行"
+    fi
+    timeout 2 bash -c "</dev/tcp/$DOMAIN/$PORT" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+        green "✅ 端口可达，节点可用"
+    else
+        red "❌ 端口不可达，节点可能不可用"
+    fi
 }
 
 # -------------------------------
@@ -161,13 +169,12 @@ while true; do
     green "================ MTProto 功能面板 (sb) ================"
     echo "1) 安装依赖"
     echo "2) 创建新节点"
-    echo "3) 启动 MTProto 后端"
+    echo "3) 启动 MTProto 后端（后台保持运行）"
     echo "4) 启动后台检测与自愈"
-    echo "5) 查看节点信息与 Telegram 链接"
+    echo "5) 查看节点状态"
     echo "0) 退出"
     echo "======================================================"
     read -p "请输入功能编号: " func
-
     case $func in
         1) install_dependencies ;;
         2) create_node ;;
@@ -178,3 +185,15 @@ while true; do
         *) red "输入错误，请输入正确编号" ;;
     esac
 done
+EOF'
+
+# 设置执行权限
+sudo chmod +x /usr/local/bin/sb
+
+# 添加 alias 到当前用户 bashrc
+if ! grep -q "alias sb=" ~/.bashrc; then
+    echo "alias sb='/usr/local/bin/sb'" >> ~/.bashrc
+fi
+source ~/.bashrc
+
+echo "✅ 安装完成，登录 VPS 后直接输入 sb 调出 MTProto 功能面板"
