@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================
-# 一键安装 MTProto Proxy（FakeTLS + 高速优化 + 后台自启 + Telegram 链接）
+# 一键安装 MTProto Proxy（适配受限 VPS / 面板环境）
 # =================================================
 
 set -e
@@ -16,8 +16,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-read -p "请输入你的域名（用于 FakeTLS，如 proxy.example.com）: " DOMAIN
-
+read -p "请输入你的域名（用于 Telegram 代理，如 proxy.example.com）: " DOMAIN
+read -p "请输入 Nginx 监听端口（默认 443，可修改为高端口测试）: " PORT
+PORT=${PORT:-443}
 green "🚀 开始部署 MTProto Proxy …"
 
 # -------------------------------
@@ -27,37 +28,6 @@ green "➤ 安装依赖 Python3、pip、Nginx …"
 apt update
 apt install -y python3 python3-pip curl unzip git nginx
 pip3 install --upgrade pycryptodome uvloop
-
-# -------------------------------
-# 系统优化
-# -------------------------------
-green "➤ 系统优化 BBR + TCP + ulimit …"
-
-cat <<EOF >/etc/sysctl.d/99-mtproto.conf
-fs.file-max = 1024000
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.netdev_max_backlog = 4096
-net.core.somaxconn = 4096
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.ip_forward = 1
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-sysctl --system
-ulimit -n 1024000
-grep -q "nofile" /etc/security/limits.conf || cat <<EOF >>/etc/security/limits.conf
-* soft nofile 1024000
-* hard nofile 1024000
-EOF
 
 # -------------------------------
 # 创建后端目录
@@ -103,7 +73,8 @@ async def pump(reader, writer, key, iv):
             if not data: break
             writer.write(aes_ctr(data, key, iv))
             await writer.drain()
-    except: pass
+    except:
+        pass
     finally:
         writer.close()
         await writer.wait_closed()
@@ -118,14 +89,15 @@ async def handle(reader, writer):
             pump(reader, tg_writer, key, iv),
             pump(tg_reader, writer, key, iv),
         )
-    except: pass
+    except:
+        pass
     finally:
         writer.close()
         await writer.wait_closed()
 
 async def main():
-    print(f"[*] MTProto 后端运行: {LISTEN[0]}:{LISTEN[1]}")
-    print(f"[*] dd-secret: dd$SECRET")
+    print(f"[] MTProto 后端运行: {LISTEN[0]}:{LISTEN[1]}")
+    print(f"[] dd-secret: dd$SECRET")
     server = await asyncio.start_server(handle, *LISTEN)
     async with server:
         await server.serve_forever()
@@ -136,33 +108,14 @@ if __name__ == "__main__":
 EOF
 
 # -------------------------------
-# systemd 服务
+# 后端直接后台启动
 # -------------------------------
-cat <<EOF >/etc/systemd/system/mtproto.service
-[Unit]
-Description=MTProto Proxy Backend
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /opt/mtproto/mtproto_backend.py
-WorkingDirectory=/opt/mtproto
-Restart=always
-RestartSec=5
-LimitNOFILE=1024000
-StandardOutput=inherit
-StandardError=inherit
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable mtproto
-systemctl start mtproto
+green "➤ 启动 MTProto 后端（nohup 后台运行）"
+nohup python3 /opt/mtproto/mtproto_backend.py >/opt/mtproto/mtproto.log 2>&1 &
+sleep 2
 
 # -------------------------------
-# Nginx TCP stream（不覆盖原 http 配置）
+# Nginx TCP stream
 # -------------------------------
 cat <<EOF >/etc/nginx/conf.d/mtproto_stream.conf
 stream {
@@ -171,7 +124,7 @@ stream {
     }
 
     server {
-        listen 443;
+        listen $PORT;
         proxy_pass mtproto_backend;
     }
 }
@@ -184,10 +137,10 @@ nginx -t && systemctl restart nginx
 # -------------------------------
 green "━━━━━━━━━━━━━━━━━━━━━━━━"
 green "✅ MTProto Proxy 已安装完成并后台运行！"
-green "👉 FakeTLS 前端: 443，后端: 8443"
+green "👉 FakeTLS 前端: $PORT，后端: 8443"
 green "👉 dd-secret: dd$SECRET"
 green "👉 Telegram 代理链接:"
-echo "tg://proxy?server=$DOMAIN&port=443&secret=dd$SECRET"
+echo "tg://proxy?server=$DOMAIN&port=$PORT&secret=dd$SECRET"
 green "━━━━━━━━━━━━━━━━━━━━━━━━"
-green "查看后端实时日志: sudo journalctl -f -u mtproto"
-yellow "⚠️ 请确保防火墙已放行 TCP 443 端口"
+green "查看后端日志: tail -f /opt/mtproto/mtproto.log"
+yellow "⚠️ 如果 443 无法监听，请尝试使用高端口"
