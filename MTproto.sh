@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================
-# 一键部署官方 MTProto Proxy + 多端口自动降级 + 后台检测
+# 一键部署官方 MTProto Proxy + 自动公网 IP + 自动端口选择 + 后台检测
 # =================================================
 
 set -e
@@ -20,7 +20,7 @@ fi
 # -------------------------------
 # 安装依赖
 # -------------------------------
-apt-get update && apt-get install -y python3-pip git >/dev/null 2>&1 || yum install -y python3-pip git
+apt-get update && apt-get install -y python3-pip git curl >/dev/null 2>&1 || yum install -y python3-pip git curl
 pip3 install --no-cache-dir mtprotoproxy >/dev/null 2>&1 || true
 
 # -------------------------------
@@ -39,6 +39,28 @@ check_port() {
 }
 
 # -------------------------------
+# 获取已有端口，避免冲突
+# -------------------------------
+used_ports=()
+if [[ -f "$NODE_INFO_FILE" ]]; then
+    while read -r line; do
+        [[ $line =~ ^PORT=([0-9]+)$ ]] && used_ports+=("${BASH_REMATCH[1]}")
+    done < $NODE_INFO_FILE
+fi
+
+# -------------------------------
+# 自动寻找可用端口
+# -------------------------------
+find_free_port() {
+    while true; do
+        PORT=$((RANDOM % 65535 + 1))
+        if ! lsof -i:$PORT >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $PORT " ]]; then
+            break
+        fi
+    done
+}
+
+# -------------------------------
 # 选择操作
 # -------------------------------
 echo "请选择操作："
@@ -47,26 +69,13 @@ echo "2) 跳过节点创建（使用已有节点）"
 read -p "输入 1 或 2: " choice
 
 if [[ "$choice" == "1" ]]; then
-    read -p "请输入你的域名或 VPS IP（用于 Telegram 代理）: " DOMAIN
-    read -p "请输入 MTProto 端口（留空随机高端）: " PORT
+    # 自动获取 VPS 公网 IP
+    green "⚡ 自动获取 VPS 公网 IP 作为 Telegram 代理地址…"
+    DOMAIN=$(curl -s https://api.ipify.org)
+    green "🌐 检测到 VPS 公网 IP: $DOMAIN"
 
-    [[ -z "$PORT" ]] && PORT=$((RANDOM % 20001 + 20000))
-
-    # 自动端口降级尝试
-    PORTS_TO_TRY=($PORT 443 80 25 110)
-    PORT_OK=0
-    for p in "${PORTS_TO_TRY[@]}"; do
-        if check_port $DOMAIN $p; then
-            PORT=$p
-            PORT_OK=1
-            green "✅ 选择端口 $PORT 可用"
-            break
-        fi
-    done
-    if [[ $PORT_OK -ne 1 ]]; then
-        red "❌ 所有常用端口均不可用，请检查 VPS 防火墙或安全组"
-        exit 1
-    fi
+    find_free_port
+    green "⚡ 自动选择可用端口: $PORT"
 
     # 生成 dd-secret
     SECRET=$(openssl rand -hex 16)
