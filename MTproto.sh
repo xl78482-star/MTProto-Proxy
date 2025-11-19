@@ -1,7 +1,6 @@
 #!/bin/bash
 # =================================================
-# 一键部署 MTProto Proxy + 智能后台检测自愈 + 最优 DC
-# 带节点创建选择 + 自动读取已有节点
+# 一键部署官方 MTProto Proxy + 多端口自动降级 + 后台检测
 # =================================================
 
 set -e
@@ -19,25 +18,25 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # -------------------------------
-# 检查 Python3 和依赖
+# 安装依赖
 # -------------------------------
-if ! command -v python3 >/dev/null 2>&1; then
-    red "Python3 未安装，请先安装 Python3"
-    exit 1
-fi
-
-if ! command -v pip3 >/dev/null 2>&1; then
-    yellow "pip3 未安装，尝试自动安装..."
-    apt-get update && apt-get install -y python3-pip || yum install -y python3-pip
-fi
-
-pip3 install --no-cache-dir uvloop pycryptodome >/dev/null 2>&1 || true
+apt-get update && apt-get install -y python3-pip git >/dev/null 2>&1 || yum install -y python3-pip git
+pip3 install --no-cache-dir mtprotoproxy >/dev/null 2>&1 || true
 
 # -------------------------------
 # 创建目录
 # -------------------------------
 mkdir -p /opt/mtproto
 NODE_INFO_FILE="/opt/mtproto/node_info"
+
+# -------------------------------
+# 检测端口可达性函数
+# -------------------------------
+check_port() {
+    local host=$1
+    local port=$2
+    timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1 && return 0 || return 1
+}
 
 # -------------------------------
 # 选择操作
@@ -48,112 +47,76 @@ echo "2) 跳过节点创建（使用已有节点）"
 read -p "输入 1 或 2: " choice
 
 if [[ "$choice" == "1" ]]; then
-    # -------------------------------
-    # 用户输入
-    # -------------------------------
     read -p "请输入你的域名或 VPS IP（用于 Telegram 代理）: " DOMAIN
-    read -p "请输入 MTProto 端口（留空随机中高端端口）: " PORT
+    read -p "请输入 MTProto 端口（留空随机高端）: " PORT
 
-    # -------------------------------
-    # 生成随机端口
-    # -------------------------------
-    if [[ -z "$PORT" ]]; then
-        while true; do
-            PORT=$((RANDOM % 20001 + 20000))
-            if ! lsof -i:$PORT >/dev/null 2>&1; then
-                break
-            fi
-        done
-        yellow "⚡ 使用随机中高端端口: $PORT"
+    [[ -z "$PORT" ]] && PORT=$((RANDOM % 20001 + 20000))
+
+    # 自动端口降级尝试
+    PORTS_TO_TRY=($PORT 443 80 25 110)
+    PORT_OK=0
+    for p in "${PORTS_TO_TRY[@]}"; do
+        if check_port $DOMAIN $p; then
+            PORT=$p
+            PORT_OK=1
+            green "✅ 选择端口 $PORT 可用"
+            break
+        fi
+    done
+    if [[ $PORT_OK -ne 1 ]]; then
+        red "❌ 所有常用端口均不可用，请检查 VPS 防火墙或安全组"
+        exit 1
     fi
 
-    green "🚀 开始部署 MTProto Proxy …"
-
-    # -------------------------------
     # 生成 dd-secret
-    # -------------------------------
     SECRET=$(openssl rand -hex 16)
-    green "🔑 生成 dd-secret: dd$SECRET"
+    green "🔑 dd-secret: dd$SECRET"
+
+    # 保存节点信息
+    echo "PORT=$PORT" > $NODE_INFO_FILE
+    echo "SECRET=dd$SECRET" >> $NODE_INFO_FILE
+    echo "DOMAIN=$DOMAIN" >> $NODE_INFO_FILE
 
     # -------------------------------
-    # 写入后端 Python 程序
+    # 写官方 MTProto Proxy 配置文件
     # -------------------------------
-    cat <<EOF > /opt/mtproto/mtproto_backend.py
-import os, uvloop, asyncio, hashlib
-from Crypto.Cipher import AES
-from Crypto.Util import Counter
-
-LISTEN = ("0.0.0.0", $PORT)
-SECRET = bytes.fromhex("$SECRET")
-TELEGRAM_DCS = [
-    ("149.154.167.50", 443),
-    ("149.154.167.91", 443),
-    ("149.154.167.92", 443),
-    ("173.240.5.253", 443),
-]
-
-def aes_key(iv, secret):
-    return hashlib.sha256(iv + secret).digest()
-
-def aes_ctr(data, key, iv):
-    ctr = Counter.new(128, initial_value=int.from_bytes(iv, 'big'))
-    cipher = AES.new(key, AES.MODE_CTR, counter=ctr)
-    return cipher.encrypt(data)
-
-async def pump(reader, writer, key, iv):
-    try:
-        while True:
-            data = await reader.read(4096)
-            if not data:
-                break
-            writer.write(aes_ctr(data, key, iv))
-            await writer.drain()
-    except:
-        pass
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def handle(reader, writer):
-    try:
-        iv = os.urandom(16)
-        key = aes_key(iv, SECRET)
-        import random
-        dc_ip, dc_port = TELEGRAM_DCS[random.randint(0,len(TELEGRAM_DCS)-1)]
-        tg_reader, tg_writer = await asyncio.open_connection(dc_ip, dc_port)
-        await asyncio.gather(
-            pump(reader, tg_writer, key, iv),
-            pump(tg_reader, writer, key, iv),
-        )
-    except:
-        pass
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def main():
-    print(f"[] MTProto 后端运行: {LISTEN[0]}:{LISTEN[1]}")
-    print(f"[] dd-secret: dd$SECRET")
-    server = await asyncio.start_server(handle, *LISTEN)
-    async with server:
-        await server.serve_forever()
-
-if __name__ == "__main__":
-    uvloop.install()
-    asyncio.run(main())
+    cat <<EOF >/opt/mtproto/config.py
+# -*- coding: utf-8 -*-
+PORT = $PORT
+USERS = {
+    "dd$SECRET": 100,
+}
+DEBUG = False
+TG_DOMAIN = "$DOMAIN"
 EOF
 
-    # -------------------------------
-    # 创建 systemd 服务 - MTProto 后端
-    # -------------------------------
-    cat <<EOF >/etc/systemd/system/mtproto.service
+elif [[ "$choice" == "2" ]]; then
+    # 使用已有节点
+    if [[ ! -f "$NODE_INFO_FILE" ]]; then
+        red "❌ 没有找到已有节点信息，请先创建节点"
+        exit 1
+    fi
+    source $NODE_INFO_FILE
+    DOMAIN=${DOMAIN:-$DOMAIN}
+    PORT=${PORT:-$PORT}
+    SECRET=${SECRET:-$SECRET}
+    green "⚡ 已读取已有节点信息: PORT=$PORT, SECRET=$SECRET, DOMAIN=$DOMAIN"
+else
+    red "输入错误，请输入 1 或 2"
+    exit 1
+fi
+
+# -------------------------------
+# 创建 systemd 服务（MTProto 后端）
+# -------------------------------
+cat <<EOF >/etc/systemd/system/mtproto.service
 [Unit]
-Description=MTProto Proxy
+Description=官方 MTProto Proxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/mtproto/mtproto_backend.py
+ExecStart=/usr/bin/python3 -m mtprotoproxy /opt/mtproto/config.py
 Restart=always
 RestartSec=5s
 WorkingDirectory=/opt/mtproto
@@ -164,100 +127,121 @@ StandardError=file:/opt/mtproto/mtproto.log
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable mtproto.service
-    systemctl start mtproto.service
-
-    # -------------------------------
-    # 防火墙开放端口
-    # -------------------------------
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow $PORT/tcp >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
-    fi
-
-    # -------------------------------
-    # 保存节点信息到文件
-    # -------------------------------
-    echo "PORT=$PORT" > $NODE_INFO_FILE
-    echo "SECRET=dd$SECRET" >> $NODE_INFO_FILE
-    echo "DOMAIN=$DOMAIN" >> $NODE_INFO_FILE
-
-    green "━━━━━━━━━━━━━━━━━━━━━━━━"
-    green "✅ MTProto Proxy 已安装完成并后台运行（systemd 自启）！"
-    green "👉 MTProto 监听端口: $PORT"
-    green "👉 dd-secret: dd$SECRET"
-    green "━━━━━━━━━━━━━━━━━━━━━━━━"
-
-elif [[ "$choice" == "2" ]]; then
-    # -------------------------------
-    # 读取已有节点信息
-    # -------------------------------
-    if [[ ! -f "$NODE_INFO_FILE" ]]; then
-        red "❌ 没有找到已有节点信息文件 $NODE_INFO_FILE，请先创建节点"
-        exit 1
-    fi
-    source $NODE_INFO_FILE
-    green "⚡ 已读取已有节点信息: PORT=$PORT, SECRET=$SECRET, DOMAIN=$DOMAIN"
-else
-    red "输入错误，请输入 1 或 2"
-    exit 1
-fi
+systemctl daemon-reload
+systemctl enable mtproto.service
+systemctl start mtproto.service
+green "✅ MTProto Proxy 后端已启动"
 
 # -------------------------------
-# 写入后台检测与自愈脚本
+# 后台检测与自愈（多端口自动降级）
 # -------------------------------
-cat <<EOF >/opt/mtproto/mtproto_monitor.sh
+cat <<'EOF' >/opt/mtproto/mtproto_monitor.sh
 #!/bin/bash
-NODE_INFO_FILE="$NODE_INFO_FILE"
+NODE_INFO_FILE="/opt/mtproto/node_info"
 DETECT_INTERVAL=15
 TELEGRAM_DCS=("149.154.167.50" "149.154.167.91" "149.154.167.92" "173.240.5.253")
+PORTS_TO_TRY=()
 
-green() { echo -e "\033[32m\$1\033[0m"; }
-yellow() { echo -e "\033[33m\$1\033[0m"; }
-red() { echo -e "\033[31m\$1\033[0m"; }
+green() { echo -e "\033[32m$1\033[0m"; }
+yellow() { echo -e "\033[33m$1\033[0m"; }
+red() { echo -e "\033[31m$1\033[0m"; }
 
-# 读取节点信息
-if [[ ! -f "\$NODE_INFO_FILE" ]]; then
-    red "❌ 节点信息文件未找到，无法启动检测"
+check_port() {
+    local host=$1
+    local port=$2
+    timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1 && return 0 || return 1
+}
+
+if [[ ! -f "$NODE_INFO_FILE" ]]; then
+    red "❌ 节点信息文件未找到"
     exit 1
 fi
-source \$NODE_INFO_FILE
+source $NODE_INFO_FILE
+
+# 初始化端口尝试顺序
+PORTS_TO_TRY=($PORT 443 80 25 110)
 
 while true; do
     echo
-    green "🔍 后端状态检测（每 \$DETECT_INTERVAL 秒刷新）…"
+    green "🔍 检测 MTProto 后端服务…"
 
     if systemctl is-active --quiet mtproto.service; then
-        green "✅ 后端服务正在运行"
+        green "✅ 后端服务运行中"
     else
-        red "❌ 后端服务未运行，尝试启动..."
+        red "❌ 服务未运行，尝试启动"
         systemctl start mtproto.service
-        sleep 2
-        if systemctl is-active --quiet mtproto.service; then
-            green "✅ 后端服务已启动成功"
-        else
-            red "❌ 后端服务启动失败，请检查日志"
-        fi
     fi
 
-    if lsof -i:\$PORT >/dev/null 2>&1; then
-        green "✅ 端口 \$PORT 正常监听"
-    else
-        red "❌ 端口 \$PORT 未监听，尝试重启后端服务..."
-        systemctl restart mtproto.service
-        sleep 2
-        if lsof -i:\$PORT >/dev/null 2>&1; then
-            green "✅ 端口 \$PORT 已正常监听"
-        else
-            red "❌ 端口 \$PORT 仍未监听，请检查防火墙或日志"
+    PORT_OK=0
+    for p in "${PORTS_TO_TRY[@]}"; do
+        if check_port $DOMAIN $p; then
+            if [[ "$p" != "$PORT" ]]; then
+                yellow "⚠️ 当前端口 $PORT 不可达，自动切换到 $p"
+                PORT=$p
+                sed -i "s/^PORT = .*/PORT = $PORT/" /opt/mtproto/config.py
+                systemctl restart mtproto.service
+            fi
+            PORT_OK=1
+            green "✅ 端口 $PORT 可用"
+            break
         fi
+    done
+
+    if [[ $PORT_OK -ne 1 ]]; then
+        red "❌ 所有常用端口均不可用，请检查 VPS 防火墙或安全组"
     fi
 
     BEST_DC=""
     LOWEST_MS=999
-    for dc in "\${TELEGRAM_DCS[@]}"; do
-        PING_MS=\$(ping -c 1 -W 1 \$dc 2>/dev/null | grep 'time=' | awk -F'time=' '{print \$2}' | awk '{print \$1}')
-        if [[ -n "\$PING_MS" ]]; then
-     
+    for dc in "${TELEGRAM_DCS[@]}"; do
+        PING_MS=$(ping -c 1 -W 1 $dc 2>/dev/null | grep 'time=' | awk -F'time=' '{print $2}' | awk '{print $1}')
+        if [[ -n "$PING_MS" ]]; then
+            PING_INT=${PING_MS%.*}
+            if [[ $PING_INT -lt $LOWEST_MS ]]; then
+                LOWEST_MS=$PING_INT
+                BEST_DC=$dc
+            fi
+        fi
+    done
+
+    if [[ -n "$BEST_DC" ]]; then
+        green "👉 最优 DC: $BEST_DC (延迟 ${LOWEST_MS}ms)"
+        echo "tg://proxy?server=$BEST_DC&port=$PORT&secret=$SECRET"
+    else
+        yellow "⚠️ 无法检测到 DC 延迟，使用默认域名生成链接"
+        echo "tg://proxy?server=$DOMAIN&port=$PORT&secret=$SECRET"
+    fi
+
+    sleep $DETECT_INTERVAL
+done
+EOF
+
+chmod +x /opt/mtproto/mtproto_monitor.sh
+
+# -------------------------------
+# systemd 服务（后台检测）
+# -------------------------------
+cat <<EOF >/etc/systemd/system/mtproto-monitor.service
+[Unit]
+Description=MTProto 后端检测与最优 DC
+After=network.target mtproto.service
+
+[Service]
+Type=simple
+ExecStart=/opt/mtproto/mtproto_monitor.sh
+Restart=always
+RestartSec=10s
+WorkingDirectory=/opt/mtproto
+StandardOutput=file:/opt/mtproto/mtproto_monitor.log
+StandardError=file:/opt/mtproto/mtproto_monitor.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable mtproto-monitor.service
+systemctl start mtproto-monitor.service
+
+green "✅ 后台检测与自愈已启动，日志: /opt/mtproto/mtproto_monitor.log"
+green "🎉 部署完成，Telegram 代理链接可在日志中查看"
