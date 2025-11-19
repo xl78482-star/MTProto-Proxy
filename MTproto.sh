@@ -4,9 +4,13 @@
 # =================================================
 
 set -e
-green(){ echo -e "\033[32m$1\033[0m"; }
-yellow(){ echo -e "\033[33m$1\033[0m"; }
-red(){ echo -e "\033[31m$1\033[0m"; }
+
+# -------------------------------
+# 彩色输出函数
+# -------------------------------
+green() { echo -e "\033[32m$1\033[0m"; }
+yellow() { echo -e "\033[33m$1\033[0m"; }
+red() { echo -e "\033[31m$1\033[0m"; }
 
 # -------------------------------
 # 检查 root
@@ -16,9 +20,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# -------------------------------
+# 用户输入
+# -------------------------------
 read -p "请输入你的域名（用于 Telegram 代理，如 proxy.example.com）: " DOMAIN
 read -p "请输入 Nginx 监听端口（默认 443，可修改为高端口测试）: " PORT
 PORT=${PORT:-443}
+
 green "🚀 开始部署 MTProto Proxy …"
 
 # -------------------------------
@@ -70,7 +78,8 @@ async def pump(reader, writer, key, iv):
     try:
         while True:
             data = await reader.read(4096)
-            if not data: break
+            if not data:
+                break
             writer.write(aes_ctr(data, key, iv))
             await writer.drain()
     except:
@@ -108,14 +117,14 @@ if __name__ == "__main__":
 EOF
 
 # -------------------------------
-# 后端直接后台启动
+# 后端后台启动
 # -------------------------------
 green "➤ 启动 MTProto 后端（nohup 后台运行）"
 nohup python3 /opt/mtproto/mtproto_backend.py >/opt/mtproto/mtproto.log 2>&1 &
 sleep 2
 
 # -------------------------------
-# Nginx TCP stream
+# Nginx TCP stream 配置
 # -------------------------------
 cat <<EOF >/etc/nginx/conf.d/mtproto_stream.conf
 stream {
