@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===============================================================
-# MTProto Proxy sb 管理面板（智能升级版 v7.1）
+# MTProto Proxy sb 管理面板（智能升级版 v7.2）
 # 功能：
 # - 自动环境检测并安装依赖
 # - 多端口多用户
@@ -388,7 +388,7 @@ panel(){
 while true; do
 clear
 echo "========================================"
-echo "       MTProto sb 管理面板（智能升级版 v7.1）"
+echo "       MTProto sb 管理面板（智能升级版 v7.2）"
 echo "========================================"
 echo "1. 自动创建节点"
 echo "2. 手动添加节点"
@@ -445,19 +445,23 @@ done
 # 18️⃣ 安装 sb 命令
 # ===============================================================
 install_sb(){
-cat > $MT_BIN <<EOF
-#!/bin/bash
-bash $MT_DIR/mtproto.sh
-EOF
-chmod +x $MT_BIN
-cp "$0" $MT_DIR/mtproto.sh
+    cp "$0" "$MT_DIR/mtproto.sh"
+    chmod +x "$MT_DIR/mtproto.sh"
 
-green "✔ sb 面板已安装"
-yellow "现在可用命令： sb"
+    cat > "$MT_BIN" <<EOF
+#!/bin/bash
+source $MT_DIR/mtproto.sh
+panel
+EOF
+
+    chmod +x "$MT_BIN"
+
+    green "✔ sb 面板已安装"
+    yellow "现在可用命令： sb"
 }
 
 # ===============================================================
-# 主程序
+# 19️⃣ 主程序
 # ===============================================================
 detect_and_install_env
 install_sb
