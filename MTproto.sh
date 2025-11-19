@@ -1,7 +1,7 @@
 #!/bin/bash
 # =================================================
 # 一键部署 MTProto (守护进程版 + 全功能面板 sb)
-# 集成依赖安装、节点创建、后端、后台监控、自带面板
+# 集成依赖安装、节点创建、后端、后台守护、面板管理、在线修改端口/SECRET，端口自动检测
 # =================================================
 
 set -e
@@ -27,6 +27,18 @@ install_dependencies() {
 }
 
 # -------------------------------
+# 检测端口是否可用
+# -------------------------------
+check_port_available() {
+    local port=$1
+    if lsof -i:$port >/dev/null 2>&1; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# -------------------------------
 # 创建节点
 # -------------------------------
 create_node() {
@@ -39,7 +51,7 @@ create_node() {
 
     while :; do
         PORT=$((RANDOM % 30000 + 30000))
-        if ! lsof -i:$PORT >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $PORT " ]]; then
+        if check_port_available $PORT && [[ ! " ${used_ports[@]} " =~ " $PORT " ]]; then
             break
         fi
     done
@@ -49,31 +61,42 @@ create_node() {
     echo "SECRET=dd$SECRET" >> $NODE_INFO_FILE
     echo "DOMAIN=$DOMAIN" >> $NODE_INFO_FILE
 
+    write_config
+    green "✅ 节点创建完成：端口 $PORT, SECRET dd$SECRET"
+}
+
+# -------------------------------
+# 写入 config.py
+# -------------------------------
+write_config() {
+    source $NODE_INFO_FILE
     cat <<CONFIG >$CONFIG_FILE
 PORT = $PORT
-USERS = {"dd$SECRET": 100}
+USERS = {"$SECRET": 100}
 DEBUG = False
 TG_DOMAIN = "$DOMAIN"
 CONFIG
-
-    green "✅ 节点创建完成：端口 $PORT, SECRET dd$SECRET"
 }
 
 # -------------------------------
 # 创建 systemd 服务
 # -------------------------------
 create_services() {
+    PYTHON_PATH=$(which python3)
+    sudo touch /opt/mtproto/mtproto.log /opt/mtproto/mtproto-monitor.log
+    sudo chmod 666 /opt/mtproto/mtproto.log /opt/mtproto/mtproto-monitor.log
+
     green "⚡ 创建 MTProto systemd 服务..."
 
     # 后端服务
-    cat <<SERVICE >$SERVICE_FILE
+    sudo bash -c "cat > $SERVICE_FILE <<EOF
 [Unit]
 Description=MTProto Proxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m mtprotoproxy $CONFIG_FILE
+ExecStart=$PYTHON_PATH -m mtprotoproxy $CONFIG_FILE
 Restart=always
 RestartSec=5s
 WorkingDirectory=/opt/mtproto
@@ -82,10 +105,10 @@ StandardError=file:/opt/mtproto/mtproto.log
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+EOF"
 
     # 监控服务
-    cat <<MONITOR >$MONITOR_FILE
+    sudo bash -c "cat > $MONITOR_FILE <<EOF
 [Unit]
 Description=MTProto Proxy Monitor
 After=network.target mtproto.service
@@ -106,11 +129,11 @@ StandardError=file:/opt/mtproto/mtproto-monitor.log
 
 [Install]
 WantedBy=multi-user.target
-MONITOR
+EOF"
 
-    systemctl daemon-reload
-    systemctl enable mtproto.service mtproto-monitor.service
-    systemctl restart mtproto.service mtproto-monitor.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable mtproto.service mtproto-monitor.service
+    sudo systemctl restart mtproto.service mtproto-monitor.service
     green "✅ 后端与监控服务已启动并设置开机自启"
 }
 
@@ -131,6 +154,8 @@ panel() {
         echo "4) 停止后端服务"
         echo "5) 重启后端服务"
         echo "6) 查看日志 (最近100行)"
+        echo "7) 修改端口 (自动检测可用性)"
+        echo "8) 修改 SECRET"
         echo "0) 退出"
         echo "============================================"
         read -p "请输入选项: " opt
@@ -144,16 +169,40 @@ panel() {
                 green "🔑 SECRET: $SECRET"
                 ;;
             3)
-                systemctl start mtproto.service && green "✅ 后端已启动"
+                sudo systemctl start mtproto.service && green "✅ 后端已启动"
                 ;;
             4)
-                systemctl stop mtproto.service && green "✅ 后端已停止"
+                sudo systemctl stop mtproto.service && green "✅ 后端已停止"
                 ;;
             5)
-                systemctl restart mtproto.service && green "✅ 后端已重启"
+                sudo systemctl restart mtproto.service && green "✅ 后端已重启"
                 ;;
             6)
                 tail -n 100 /opt/mtproto/mtproto.log
+                ;;
+            7)
+                read -p "请输入新端口: " new_port
+                if [[ $new_port =~ ^[0-9]+$ ]] && [ $new_port -ge 1024 ] && [ $new_port -le 65535 ]; then
+                    if check_port_available $new_port; then
+                        sed -i "s/^PORT=.*/PORT=$new_port/" $NODE_INFO_FILE
+                        write_config
+                        sudo systemctl restart mtproto.service
+                        PORT=$new_port
+                        green "✅ 端口已修改为 $new_port 并重启后端"
+                    else
+                        red "❌ 端口 $new_port 已被占用，请选择其他端口"
+                    fi
+                else
+                    red "❌ 无效端口"
+                fi
+                ;;
+            8)
+                new_secret="dd$(openssl rand -hex 16)"
+                sed -i "s/^SECRET=.*/SECRET=$new_secret/" $NODE_INFO_FILE
+                write_config
+                SECRET=$new_secret
+                sudo systemctl restart mtproto.service
+                green "✅ SECRET 已修改为 $new_secret 并重启后端"
                 ;;
             0)
                 break
