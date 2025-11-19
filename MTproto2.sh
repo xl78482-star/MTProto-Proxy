@@ -1,81 +1,132 @@
 #!/bin/bash
 # =================================================
-# MTProto 代理一键检测脚本
+# MTProto Proxy 检测脚本（自动推荐最佳 DC + 生成链接）
 # =================================================
 
 set -e
 
-VPS_IP="103.193.172.97"   # 你的 VPS IP
-PORT=443                  # Nginx 前端监听端口
-BACKEND_PORT=8443         # Python 后端端口
-
-green()  { echo -e "\033[32m$1\033[0m"; }
+green() { echo -e "\033[32m$1\033[0m"; }
 yellow() { echo -e "\033[33m$1\033[0m"; }
-red()    { echo -e "\033[31m$1\033[0m"; }
-
-green "🚀 开始检测 MTProto 代理可用性 …"
+red() { echo -e "\033[31m$1\033[0m"; }
 
 # -------------------------------
-# 检查 Nginx stream 模块
+# 用户输入
 # -------------------------------
-if nginx -V 2>&1 | grep -- '--with-stream' >/dev/null; then
-    green "✔ Nginx 支持 stream 模块"
+read -p "请输入你的域名或 VPS IP: " DOMAIN
+
+# -------------------------------
+# 检查 Python 后端进程
+# -------------------------------
+PID=$(pgrep -f mtproto_backend.py || true)
+if [[ -z "$PID" ]]; then
+    red "❌ MTProto 后端未运行！"
 else
-    red "✖ Nginx 未启用 stream 模块"
+    green "✅ MTProto 后端正在运行，PID: $PID"
 fi
 
 # -------------------------------
-# 检查 Nginx 配置和端口
+# 获取监听端口
 # -------------------------------
-if nginx -t >/dev/null 2>&1; then
-    green "✔ Nginx 配置语法正确"
+if [[ -f /opt/mtproto/mtproto_backend.py ]]; then
+    PORT=$(grep "LISTEN = " /opt/mtproto/mtproto_backend.py | grep -oP '\d+')
+    green "⚡ 监听端口: $PORT"
 else
-    red "✖ Nginx 配置有错误"
-fi
-
-if ss -tlnp | grep ":$PORT" >/dev/null; then
-    green "✔ Nginx 前端端口 $PORT 已监听"
-else
-    red "✖ Nginx 前端端口 $PORT 未监听"
+    yellow "⚠️ 后端脚本不存在，无法获取端口"
 fi
 
 # -------------------------------
-# 检查 Python 后端
+# 获取 dd-secret
 # -------------------------------
-if ps aux | grep mtproto_backend.py | grep -v grep >/dev/null; then
-    green "✔ Python 后端正在运行"
-else
-    red "✖ Python 后端未运行"
-fi
-
-if ss -tlnp | grep ":$BACKEND_PORT" >/dev/null; then
-    green "✔ Python 后端端口 $BACKEND_PORT 已监听"
-else
-    red "✖ Python 后端端口 $BACKEND_PORT 未监听"
+if [[ -f /opt/mtproto/mtproto_backend.py ]]; then
+    SECRET=$(grep "SECRET = bytes.fromhex" /opt/mtproto/mtproto_backend.py | grep -oP '[0-9a-f]{32}')
+    green "🔑 dd-secret: dd$SECRET"
 fi
 
 # -------------------------------
-# 测试 VPS 到 Telegram DC 的连通性
+# 本地端口连通性
+# -------------------------------
+if [[ ! -z "$PORT" ]]; then
+    if command -v nc >/dev/null 2>&1; then
+        nc -zvw3 127.0.0.1 $PORT
+        if [[ $? -eq 0 ]]; then
+            green "✅ 本地端口 $PORT 可连接"
+        else
+            red "❌ 本地端口 $PORT 无法连接"
+        fi
+    else
+        yellow "⚠️ nc 命令不可用，无法检测本地端口"
+    fi
+fi
+
+# -------------------------------
+# 远程端口连通性
+# -------------------------------
+if [[ ! -z "$PORT" ]]; then
+    green "🌐 测试远程端口连通性（模拟客户端）:"
+    if command -v nc >/dev/null 2>&1; then
+        nc -zvw5 $DOMAIN $PORT
+        if [[ $? -eq 0 ]]; then
+            green "✅ $DOMAIN:$PORT 可从远程访问"
+        else
+            red "❌ $DOMAIN:$PORT 无法从远程访问，请检查防火墙或安全组"
+        fi
+    else
+        yellow "⚠️ nc 命令不可用，无法检测远程端口"
+    fi
+fi
+
+# -------------------------------
+# Telegram DC 平均延迟测试
 # -------------------------------
 TELEGRAM_DCS=("149.154.167.50" "149.154.167.91" "149.154.167.92" "173.240.5.253")
+green "🌐 Telegram DC 平均延迟测试 (ping 5 次):"
 
-for DC in "${TELEGRAM_DCS[@]}"; do
-    echo -n "测试到 Telegram DC $DC:443 … "
-    if timeout 3 bash -c "echo > /dev/tcp/$DC/443" >/dev/null 2>&1; then
-        green "✔ 连通"
-    else
-        red "✖ 不通"
+BEST_DC=""
+MIN_AVG=9999
+
+for ip in "${TELEGRAM_DCS[@]}"; do
+    if command -v ping >/dev/null 2>&1; then
+        PING_TOTAL=0
+        COUNT=0
+        for i in {1..5}; do
+            TIME_MS=$(ping -c 1 -W 1 $ip | grep 'time=' | awk -F'time=' '{print $2}' | awk '{print $1}')
+            if [[ ! -z "$TIME_MS" ]]; then
+                PING_TOTAL=$(echo "$PING_TOTAL + $TIME_MS" | bc)
+                COUNT=$((COUNT + 1))
+            fi
+        done
+        if [[ $COUNT -gt 0 ]]; then
+            AVG=$(echo "scale=2; $PING_TOTAL / $COUNT" | bc)
+            green "DC $ip 平均延迟: ${AVG} ms"
+            if (( $(echo "$AVG < $MIN_AVG" | bc -l) )); then
+                MIN_AVG=$AVG
+                BEST_DC=$ip
+            fi
+        else
+            yellow "DC $ip 无法 ping 通"
+        fi
     fi
 done
 
-# -------------------------------
-# 测试 VPS 前端端口可达性
-# -------------------------------
-echo -n "测试 VPS 公网 IP $VPS_IP:$PORT 可达性 … "
-if timeout 3 bash -c "echo > /dev/tcp/$VPS_IP/$PORT" >/dev/null 2>&1; then
-    green "✔ 可达"
-else
-    red "✖ 不可达（检查防火墙或安全组）"
+if [[ ! -z "$BEST_DC" ]]; then
+    green "⚡ 推荐最佳 DC: $BEST_DC（平均延迟 ${MIN_AVG} ms）"
 fi
 
-green "✅ 检测完成"
+# -------------------------------
+# Telegram 客户端链接（使用最佳 DC）
+# -------------------------------
+if [[ ! -z "$PORT" && ! -z "$SECRET" && ! -z "$DOMAIN" ]]; then
+    PROXY_LINK="tg://proxy?server=$DOMAIN&port=$PORT&secret=dd$SECRET"
+    green "Telegram 代理链接 (可直接导入客户端):"
+    echo "$PROXY_LINK"
+    if [[ ! -z "$BEST_DC" ]]; then
+        green "⚡ 注意: 推荐优先连接 DC $BEST_DC"
+    fi
+else
+    yellow "⚠️ 无法生成 Telegram 链接，请手动检查 DOMAIN/端口/SECRET"
+fi
+
+# -------------------------------
+# 后端日志提示
+# -------------------------------
+green "查看后端日志: tail -f /opt/mtproto/logs/mtproto.log"
