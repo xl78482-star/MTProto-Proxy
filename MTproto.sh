@@ -1,185 +1,245 @@
 #!/bin/bash
-# =================================================
-# MTProto Proxy 一键部署（集成 sb 面板，不需额外文件）
-# =================================================
-
-set -e
+# ===============================================================
+# MTProto Proxy sb 管理面板（智能升级版 v6）
+# 功能：
+# - 多端口多用户
+# - FakeTLS 支持
+# - 智能环境检测
+# - 节点状态检测
+# - 自动健康检测与修复
+# - 一键生成 Telegram 客户端代理链接
+# - 日志记录与查看功能
+# - 多节点快速切换功能
+# ===============================================================
 
 green(){ echo -e "\033[32m$1\033[0m"; }
 yellow(){ echo -e "\033[33m$1\033[0m"; }
 red(){ echo -e "\033[31m$1\033[0m"; }
 
-BASE_DIR="/opt/mtproto"
-PY_FILE="$BASE_DIR/mtproxy.py"
-SERVICE_FILE="/etc/systemd/system/mtproto.service"
-NODE_INFO="$BASE_DIR/node_info"
+MT_DIR="/usr/local/mtproto"
+MT_BIN="/usr/local/bin/sb"
+MT_SERVICE="/etc/systemd/system/mtproto.service"
+CONFIG_FILE="$MT_DIR/nodes.conf"
+LOG_FILE="$MT_DIR/mtproto.log"
 
-# 随机端口
-random_port(){ shuf -i 20000-50000 -n 1; }
+mkdir -p $MT_DIR
 
-# -------------------------------
-# 检查 root
-# -------------------------------
-[[ $EUID -ne 0 ]] && red "请用 root 运行" && exit 1
-
-mkdir -p $BASE_DIR
-
-# -------------------------------
-# 创建 Python 后端
-# -------------------------------
-create_backend(){
-PORT=$(random_port)
-
-cat > $PY_FILE << EOF
-import socket, threading
-
-LISTEN_HOST="0.0.0.0"
-LISTEN_PORT=$PORT
-
-def handle(c,a):
-    try: c.send(b"00000000000000000000000000000000")
-    except: pass
-    c.close()
-
-def main():
-    s=socket.socket()
-    s.bind((LISTEN_HOST, LISTEN_PORT))
-    s.listen(128)
-    print("MTProto运行 端口:", LISTEN_PORT)
-    while True:
-        c,a=s.accept()
-        threading.Thread(target=handle,args=(c,a)).start()
-
-if __name__=="__main__":
-    main()
-EOF
-
-chmod +x $PY_FILE
-
-echo "PORT=$PORT" > $NODE_INFO
-echo "SECRET=00000000000000000000000000000000" >> $NODE_INFO
-echo "IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)" >> $NODE_INFO
-
-green "后端创建成功"
+# ===============================================================
+# 日志记录函数
+# ===============================================================
+log(){
+    TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$TIMESTAMP] $1" >> $LOG_FILE
 }
 
-# -------------------------------
-# 创建 systemd 服务
-# -------------------------------
-create_service(){
-systemctl stop mtproto >/dev/null 2>&1 || true
-rm -f $SERVICE_FILE
+# ===============================================================
+# 公网 IP 检测
+# ===============================================================
+detect_ip(){
+    IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me || curl -s ip.sb)
+    if [[ -z "$IP" ]]; then
+        red "❌ 自动检测失败，请手动输入 IP："
+        read -p "输入 IP: " IP
+    fi
+}
 
-cat > $SERVICE_FILE << EOF
+# ===============================================================
+# 生成 Secret
+# ===============================================================
+gen_secret(){
+    openssl rand -hex 16
+}
+
+# ===============================================================
+# 环境检测
+# ===============================================================
+detect_env(){
+    CPU_CORES=$(nproc)
+    MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+    ping_time=$(ping -c 2 8.8.8.8 | tail -1| awk -F '/' '{print $5}')
+
+    green "VPS 环境检测：CPU $CPU_CORES 核, 内存 $MEM_TOTAL MB, 网络延迟 $ping_time ms"
+
+    if [[ $CPU_CORES -ge 4 && $MEM_TOTAL -ge 2048 ]]; then
+        SCAN_PORT_COUNT=2000
+        MAX_NODES=10
+        FAKE_HOSTS=("www.gstatic.com" "www.google.com" "www.youtube.com")
+    else
+        SCAN_PORT_COUNT=500
+        MAX_NODES=3
+        FAKE_HOSTS=("www.gstatic.com")
+    fi
+}
+
+# ===============================================================
+# 根据环境选择最佳参数
+# ===============================================================
+select_best_params(){
+    if [[ ${#FAKE_HOSTS[@]} -gt 0 ]]; then
+        FAKE_HOST=${FAKE_HOSTS[$RANDOM % ${#FAKE_HOSTS[@]}]}
+    else
+        FAKE_HOST="www.gstatic.com"
+    fi
+
+    PORT=$(for port in $(shuf -i 20000-39999 -n $SCAN_PORT_COUNT); do
+        if ! lsof -i:$port >/dev/null 2>&1; then
+            echo $port
+            break
+        fi
+    done)
+
+    if [[ -z $PORT ]]; then
+        red "❌ 未找到可用端口"
+        exit 1
+    fi
+}
+
+# ===============================================================
+# 写入 systemd 服务
+# ===============================================================
+write_service(){
+    cat > $MT_SERVICE <<EOF
 [Unit]
-Description=MTProto Proxy
+Description=MTProto Proxy Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 $PY_FILE
-WorkingDirectory=$BASE_DIR
+ExecStart=/usr/bin/python3 -m mtproto_proxy --port $PORT --secret $SECRET --tls $FAKE_HOST
+WorkingDirectory=$MT_DIR
 Restart=always
-RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-chmod 644 $SERVICE_FILE
-systemctl daemon-reload
-systemctl enable mtproto
-systemctl restart mtproto
-
-green "systemd 服务创建成功"
-}
-
-# -------------------------------
-# SB 面板（集成版）
-# -------------------------------
-panel(){
-while true; do
-clear
-green "=============== MTProto sb 面板 ==============="
-echo
-yellow "1. 查看节点信息"
-yellow "2. 重启后端"
-yellow "3. 重装后端（换端口）"
-yellow "4. 退出面板"
-echo
-read -p "请输入选项: " num
-
-case $num in
-1)
-    if [[ ! -f "$NODE_INFO" ]]; then red "未检测到节点"; else
-        green "📌 节点信息："
-        cat $NODE_INFO
-        echo
-        IP=$(grep IP $NODE_INFO | cut -d= -f2)
-        PORT=$(grep PORT $NODE_INFO | cut -d= -f2)
-        SECRET=$(grep SECRET $NODE_INFO | cut -d= -f2)
-        green "Telegram 代理链接："
-        echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
-    fi
-    read -p "按回车返回菜单..."
-;;
-2)
+    systemctl daemon-reload
+    systemctl enable mtproto
     systemctl restart mtproto
-    green "已重启"
-    sleep 1
-;;
-3)
-    green "重装后端..."
-    create_backend
-    create_service
-    sleep 1
-;;
-4)
-    exit 0
-;;
-*)
-    red "无效选项"
-;;
-esac
-done
 }
 
-# -------------------------------
-# Alias sb (不创建文件)
-# -------------------------------
-add_alias(){
-if ! grep -q "mtproto_sb" /etc/bash.bashrc; then
-    echo "alias sb='bash $0 --panel'" >> /etc/bash.bashrc
-    source /etc/bash.bashrc
-fi
+# ===============================================================
+# 保存节点信息
+# ===============================================================
+save_node(){
+    echo "$PORT $SECRET $FAKE_HOST" >> $CONFIG_FILE
+    log "创建新节点: 端口 $PORT | Secret $SECRET | FakeTLS $FAKE_HOST"
 }
 
-# -------------------------------
-# 主安装流程
-# -------------------------------
-if [[ "$1" == "--panel" ]]; then
-    panel
-    exit 0
-fi
+# ===============================================================
+# 显示节点信息
+# ===============================================================
+show_nodes(){
+    detect_ip
+    if [[ ! -f $CONFIG_FILE ]]; then
+        red "❌ 没有节点，请先创建"
+        return
+    fi
+    echo "================= 节点列表 ================="
+    while read port secret host; do
+        LINK="tg://proxy?server=$IP&port=$port&secret=$secret"
+        echo "端口: $port | Secret: $secret | FakeTLS域名: $host"
+        echo "连接链接: $LINK"
+        echo "-------------------------------------------"
+    done < $CONFIG_FILE
+}
 
-create_backend
-create_service
-add_alias
+# ===============================================================
+# 节点状态检测
+# ===============================================================
+check_status(){
+    detect_ip
+    if [[ ! -f $CONFIG_FILE ]]; then
+        red "❌ 没有节点，请先创建"
+        return
+    fi
+    echo "================ 节点状态检测 ================"
+    while read port secret host; do
+        status_service="❌ 后端未运行"
+        status_port="❌ 端口未监听"
+        status_tcp="❌ 不可连通"
 
-IP=$(grep IP $NODE_INFO | cut -d= -f2)
-PORT=$(grep PORT $NODE_INFO | cut -d= -f2)
-SECRET=$(grep SECRET $NODE_INFO | cut -d= -f2)
+        if systemctl is-active --quiet mtproto; then
+            status_service="✔ 后端运行中"
+        fi
 
-green "=============================================="
-green "   MTProto Proxy 安装成功 ✓"
-green "=============================================="
-yellow "服务器: $IP"
-yellow "端口: $PORT"
-yellow "Secret: $SECRET"
-echo
-green "Telegram 一键代理链接："
-echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
-echo
-green "启动面板: sb"
-green "重启服务: systemctl restart mtproto"
-green "查看日志: journalctl -u mtproto -f"
+        if lsof -i:$port >/dev/null 2>&1; then
+            status_port="✔ 端口已监听"
+        fi
+
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z -w3 $IP $port >/dev/null 2>&1; then
+                status_tcp="✔ 可连通"
+            fi
+        fi
+
+        echo "端口: $port | Secret: $secret | FakeTLS域名: $host"
+        echo "状态: $status_service | $status_port | $status_tcp"
+        echo "-------------------------------------------"
+    done < $CONFIG_FILE
+}
+
+# ===============================================================
+# 自动创建节点
+# ===============================================================
+auto_create(){
+    detect_env
+    select_best_params
+    SECRET=$(gen_secret)
+    save_node
+    write_service
+    show_nodes
+}
+
+# ===============================================================
+# 手动添加节点
+# ===============================================================
+manual_add(){
+    detect_env
+    select_best_params
+    SECRET=$(gen_secret)
+    read -p "是否使用自动选择的端口和FakeTLS？(y/n) 默认y: " use_auto
+    use_auto=${use_auto:-y}
+    if [[ $use_auto == "n" ]]; then
+        read -p "输入端口: " PORT
+        read -p "输入 Secret: " SECRET
+        read -p "输入 FakeTLS 域名（默认 www.gstatic.com）: " FAKE_HOST
+        FAKE_HOST=${FAKE_HOST:-www.gstatic.com}
+    fi
+    save_node
+    write_service
+    show_nodes
+}
+
+# ===============================================================
+# 健康检测与自动修复
+# ===============================================================
+health_check(){
+    while true; do
+        sleep 15
+        if [[ ! -f $CONFIG_FILE ]]; then
+            continue
+        fi
+        detect_ip
+        while read port secret host; do
+            restart_needed=0
+            if ! systemctl is-active --quiet mtproto; then
+                red "❌ 后端服务未运行，自动重启..."
+                log "后端服务未运行，自动重启"
+                restart_needed=1
+            fi
+            if ! lsof -i:$port >/dev/null 2>&1; then
+                red "❌ 端口 $port 未监听，分配新端口..."
+                log "端口 $port 未监听，分配新端口"
+                PORT=$(for p in $(shuf -i 20000-39999 -n $SCAN_PORT_COUNT); do
+                    if ! lsof -i:$p >/dev/null 2>&1; then
+                        echo $p
+                        break
+                    fi
+                done)
+                restart_needed=1
+            else
+                PORT=$port
+            fi
+            if command -v nc >/dev/null 2>&1; then
+                if ! nc -z -w3 $IP $PORT >/dev/null 2>&1; then
+                    red "❌ 
