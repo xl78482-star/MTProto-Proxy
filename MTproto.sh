@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===============================================================
-# MTProto Proxy sb 管理面板（智能升级版 v7.2 完整版）
+# MTProto Proxy sb 管理面板（智能升级版 v7.2 完整版，跳过 python3-pip 检测）
 # ===============================================================
 
 green(){ echo -e "\033[32m$1\033[0m"; }
@@ -8,9 +8,9 @@ yellow(){ echo -e "\033[33m$1\033[0m"; }
 red(){ echo -e "\033[31m$1\033[0m"; }
 
 # ===============================================================
-# 0️⃣ 自动检测依赖并安装（已安装跳过）
+# 0️⃣ 自动检测依赖（跳过 python3-pip）
 # ===============================================================
-DEPENDENCIES=("git" "curl" "wget" "python3" "python3-pip" "openssl" "lsof" "nc" "shuf")
+DEPENDENCIES=("git" "curl" "wget" "python3" "openssl" "lsof" "nc" "shuf")
 
 echo "🔍 检查依赖..."
 MISSING_DEPS=()
@@ -35,6 +35,182 @@ if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     fi
 fi
 
+# 再次确认所有依赖
+FAILED_DEPS=()
+for pkg in "${DEPENDENCIES[@]}"; do
+    if ! command -v $pkg >/dev/null 2>&1; then
+        FAILED_DEPS+=("$pkg")
+    fi
+done
+
+if [ ${#FAILED_DEPS[@]} -gt 0 ]; then
+    red "❌ 以下依赖安装失败: ${FAILED_DEPS[*]}"
+    exit 1
+else
+    green "✔ 所有依赖已安装或已存在，继续执行脚本"
+fi
+
+# ===============================================================
+# 1️⃣ Python 模块检测
+# ===============================================================
+if ! python3 -c "import mtproto_proxy" >/dev/null 2>&1; then
+    red "❌ mtproto_proxy 模块未安装，请确保系统已安装 pip 并手动安装 mtproto_proxy"
+    exit 1
+else
+    green "✔ mtproto_proxy 模块已安装"
+fi
+
+# ===============================================================
+# 2️⃣ 基础路径和日志
+# ===============================================================
+MT_DIR="/usr/local/mtproto"
+MT_BIN="/usr/local/bin/sb"
+MT_SERVICE="/etc/systemd/system/mtproto.service"
+CONFIG_FILE="$MT_DIR/nodes.conf"
+LOG_FILE="$MT_DIR/mtproto.log"
+
+mkdir -p $MT_DIR
+
+log(){ TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S"); echo "[$TIMESTAMP] $1" >> $LOG_FILE; }
+
+# ===============================================================
+# 3️⃣ 公网 IP 检测
+# ===============================================================
+detect_ip(){
+    IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me || curl -s ip.sb)
+    if [[ -z "$IP" ]]; then
+        red "❌ 自动检测失败，请手动输入 IP："
+        read -p "输入 IP: " IP
+    fi
+}
+
+# ===============================================================
+# 4️⃣ 生成 Secret
+# ===============================================================
+gen_secret(){ openssl rand -hex 16; }
+
+# ===============================================================
+# 5️⃣ 环境检测
+# ===============================================================
+detect_env(){
+    CPU_CORES=$(nproc)
+    MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+    ping_time=$(ping -c 2 8.8.8.8 | tail -1| awk -F '/' '{print $5}')
+    green "VPS 环境检测：CPU $CPU_CORES 核, 内存 $MEM_TOTAL MB, 网络延迟 $ping_time ms"
+
+    if [[ $CPU_CORES -ge 4 && $MEM_TOTAL -ge 2048 ]]; then
+        SCAN_PORT_COUNT=2000
+        MAX_NODES=10
+        FAKE_HOSTS=("www.gstatic.com" "www.google.com" "www.youtube.com")
+    else
+        SCAN_PORT_COUNT=500
+        MAX_NODES=3
+        FAKE_HOSTS=("www.gstatic.com")
+    fi
+}
+
+# ===============================================================
+# 6️⃣ 选择端口和 FakeTLS
+# ===============================================================
+select_best_params(){
+    if [[ ${#FAKE_HOSTS[@]} -gt 0 ]]; then
+        FAKE_HOST=${FAKE_HOSTS[$RANDOM % ${#FAKE_HOSTS[@]}]}
+    else
+        FAKE_HOST="www.gstatic.com"
+    fi
+
+    PORT=$(for port in $(shuf -i 20000-39999 -n $SCAN_PORT_COUNT); do
+        if ! lsof -i:$port >/dev/null 2>&1; then
+            echo $port
+            break
+        fi
+    done)
+
+    if [[ -z $PORT ]]; then
+        red "❌ 未找到可用端口"
+        exit 1
+    fi
+}
+
+# ===============================================================
+# 7️⃣ 写 systemd 服务
+# ===============================================================
+write_service(){
+    cat > $MT_SERVICE <<EOF
+[Unit]
+Description=MTProto Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m mtproto_proxy --port $PORT --secret $SECRET --tls $FAKE_HOST
+WorkingDirectory=$MT_DIR
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable mtproto
+    systemctl restart mtproto
+}
+
+# ===============================================================
+# 8️⃣ 节点管理函数
+# ===============================================================
+save_node(){ echo "$PORT $SECRET $FAKE_HOST" >> $CONFIG_FILE; log "创建节点: $PORT $SECRET $FAKE_HOST"; }
+
+show_nodes(){
+    detect_ip
+    [[ ! -f $CONFIG_FILE ]] && { red "❌ 没有节点"; return; }
+    echo "================ 节点列表 ================="
+    while read port secret host; do
+        LINK="tg://proxy?server=$IP&port=$port&secret=$secret"
+        echo "端口: $port | Secret: $secret | FakeTLS: $host"
+        echo "链接: $LINK"
+        echo "-------------------------------------------"
+    done < $CONFIG_FILE
+}
+
+check_status(){
+    detect_ip
+    [[ ! -f $CONFIG_FILE ]] && { red "❌ 没有节点"; return; }
+    echo "================ 节点状态检测 ================"
+    while read port secret host; do
+        status_service="❌ 后端未运行"; status_port="❌ 端口未监听"; status_tcp="❌ 不可连通"
+        systemctl is-active --quiet mtproto && status_service="✔ 后端运行中"
+        lsof -i:$port >/dev/null 2>&1 && status_port="✔ 端口已监听"
+        command -v nc >/dev/null 2>&1 && nc -z -w3 $IP $port >/dev/null 2>&1 && status_tcp="✔ 可连通"
+        echo "端口: $port | Secret: $secret | FakeTLS: $host"
+        echo "状态: $status_service | $status_port | $status_tcp"
+        echo "-------------------------------------------"
+    done < $CONFIG_FILE
+}
+
+auto_create(){ detect_env; select_best_params; SECRET=$(gen_secret); save_node; write_service; show_nodes; }
+
+manual_add(){
+    detect_env; select_best_params; SECRET=$(gen_secret)
+    read -p "使用自动端口和FakeTLS? (y/n) 默认y: " use_auto; use_auto=${use_auto:-y}
+    if [[ $use_auto == "n" ]]; then
+        read -p "输入端口: " PORT
+        read -p "输入 Secret: " SECRET
+        read -p "输入 FakeTLS 域名 (默认 www.gstatic.com): " FAKE_HOST; FAKE_HOST=${FAKE_HOST:-www.gstatic.com}
+    fi
+    save_node; write_service; show_nodes
+}
+
+health_check(){
+    while true; do
+        sleep 15
+        [[ ! -f $CONFIG_FILE ]] && continue
+        detect_ip
+        while read port secret host; do
+            restart_needed=0
+            ! systemctl is-active --quiet mtproto && { log "后端未运行，重启"; restart_needed=1; }
+            ! lsof -i:$port >/dev/null 2>&1 && { PORT=$(for p in $(shuf -i 20000-39999 -n $SCAN_PORT_COUNT); do lsof -i:$p >/dev/null 2>&1 || echo $p; done); restart_needed=1; }
+            command -v nc >/dev/null 2>&1 && ! nc -z -w3 $IP $PORT >/dev/null 2>&1 && restart_needed=1
+            [[ $restart_needed -eq 1 ]] && syste
 # 再次确认所有依赖
 FAILED_DEPS=()
 for pkg in "${DEPENDENCIES[@]}"; do
