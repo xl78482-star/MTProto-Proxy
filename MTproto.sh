@@ -1,6 +1,7 @@
 #!/bin/bash
 # =================================================
 # 一键部署 MTProto + 功能面板 (sb)
+# 自动检测可用端口
 # =================================================
 
 set -e
@@ -29,6 +30,9 @@ red() { echo -e "\033[31m$1\033[0m"; }
 
 NODE_INFO_FILE="/opt/mtproto/node_info"
 
+# -------------------------------
+# 安装依赖
+# -------------------------------
 install_dependencies() {
     green "⚡ 安装依赖..."
     apt-get update && apt-get install -y python3-pip git curl >/dev/null 2>&1 || yum install -y python3-pip git curl
@@ -36,34 +40,55 @@ install_dependencies() {
     green "✅ 依赖安装完成"
 }
 
+# -------------------------------
+# 创建节点（自动检测可用端口）
+# -------------------------------
 create_node() {
     green "⚡ 创建新节点..."
     mkdir -p /opt/mtproto
     DOMAIN=$(curl -s https://api.ipify.org)
     green "🌐 检测到 VPS 公网 IP: $DOMAIN"
+
+    # 已用端口
     used_ports=()
     [[ -f "$NODE_INFO_FILE" ]] && used_ports=($(awk -F= '/PORT/ {print $2}' $NODE_INFO_FILE))
-    while true; do
-        PORT=$((RANDOM % 65535 + 1))
-        if ! lsof -i:$PORT >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $PORT " ]]; then
+
+    # 自动检测可用端口
+    for ((p=1;p<=65535;p++)); do
+        if ! lsof -i:$p >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $p " ]]; then
+            PORT=$p
             break
         fi
     done
-    green "⚡ 使用端口: $PORT"
+
+    if [[ -z "$PORT" ]]; then
+        red "❌ 没有找到可用端口"
+        exit 1
+    fi
+
+    green "⚡ 使用可用端口: $PORT"
     SECRET=$(openssl rand -hex 16)
     green "🔑 dd-secret: dd$SECRET"
+
+    # 保存节点信息
     echo "PORT=$PORT" > $NODE_INFO_FILE
     echo "SECRET=dd$SECRET" >> $NODE_INFO_FILE
     echo "DOMAIN=$DOMAIN" >> $NODE_INFO_FILE
+
+    # 生成配置文件
     cat <<CONFIG >/opt/mtproto/config.py
 PORT = $PORT
 USERS = {"dd$SECRET": 100}
 DEBUG = False
 TG_DOMAIN = "$DOMAIN"
 CONFIG
+
     green "✅ 节点创建完成"
 }
 
+# -------------------------------
+# 启动 MTProto 后端
+# -------------------------------
 start_backend() {
     green "⚡ 启动 MTProto 后端..."
     mkdir -p /opt/mtproto
@@ -91,8 +116,11 @@ SERVICE
     green "✅ 后端服务已启动并保持运行"
 }
 
+# -------------------------------
+# 后台监控与自愈
+# -------------------------------
 start_monitor() {
-    green "⚡ 启动后台检测与自愈..."
+    green "⚡ 启动后台监控与自愈..."
     cat <<'MONITOR' >/opt/mtproto/mtproto_monitor.sh
 #!/bin/bash
 NODE_INFO_FILE="/opt/mtproto/node_info"
@@ -124,7 +152,7 @@ MONITOR
     chmod +x /opt/mtproto/mtproto_monitor.sh
     cat <<SERVICE >/etc/systemd/system/mtproto-monitor.service
 [Unit]
-Description=MTProto 后端检测与自愈
+Description=MTProto 后端监控与自愈
 After=network.target mtproto.service
 
 [Service]
@@ -143,9 +171,12 @@ SERVICE
     systemctl daemon-reload
     systemctl enable mtproto-monitor.service
     systemctl restart mtproto-monitor.service
-    green "✅ 后台检测已启动并保持运行"
+    green "✅ 后台监控已启动并保持运行"
 }
 
+# -------------------------------
+# 查看节点状态
+# -------------------------------
 show_info() {
     if [[ ! -f "$NODE_INFO_FILE" ]]; then
         red "❌ 节点信息未找到"
@@ -177,7 +208,7 @@ while true; do
     echo "1) 安装依赖"
     echo "2) 创建新节点"
     echo "3) 启动 MTProto 后端"
-    echo "4) 启动后台检测与自愈"
+    echo "4) 启动后台监控与自愈"
     echo "5) 查看节点状态"
     echo "0) 退出"
     echo "======================================================"
@@ -203,7 +234,7 @@ if ! grep -q "alias sb=" ~/.bashrc; then
 fi
 source ~/.bashrc
 
-green "✅ 安装完成！登录 VPS 后直接输入 sb 调出 MTProto 功能面板"
+green "✅ 安装完成！登录 VPS 后直接输入 sb 调出 MTProto 面板"
 }
 
 # -------------------------------
