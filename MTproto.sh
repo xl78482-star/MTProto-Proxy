@@ -53,18 +53,13 @@ create_node() {
     used_ports=()
     [[ -f "$NODE_INFO_FILE" ]] && used_ports=($(awk -F= '/PORT/ {print $2}' $NODE_INFO_FILE))
 
-    # 自动检测可用端口
-    for ((p=1;p<=65535;p++)); do
-        if ! lsof -i:$p >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $p " ]]; then
-            PORT=$p
+    # 自动检测可用端口（中高端随机端口）
+    while :; do
+        PORT=$((RANDOM % 30000 + 30000))
+        if ! lsof -i:$PORT >/dev/null 2>&1 && [[ ! " ${used_ports[@]} " =~ " $PORT " ]]; then
             break
         fi
     done
-
-    if [[ -z "$PORT" ]]; then
-        red "❌ 没有找到可用端口"
-        exit 1
-    fi
 
     green "⚡ 使用可用端口: $PORT"
     SECRET=$(openssl rand -hex 16)
@@ -198,43 +193,12 @@ show_info() {
         red "❌ 端口不可达，节点可能不可用"
     fi
 }
-
-# -------------------------------
-# 功能面板主循环
-# -------------------------------
-while true; do
-    echo
-    green "================ MTProto 功能面板 (sb) ================"
-    echo "1) 安装依赖"
-    echo "2) 创建新节点"
-    echo "3) 启动 MTProto 后端"
-    echo "4) 启动后台监控与自愈"
-    echo "5) 查看节点状态"
-    echo "0) 退出"
-    echo "======================================================"
-    read -p "请输入功能编号: " func
-    case $func in
-        1) install_dependencies ;;
-        2) create_node ;;
-        3) start_backend ;;
-        4) start_monitor ;;
-        5) show_info ;;
-        0) exit 0 ;;
-        *) red "输入错误，请输入正确编号" ;;
-    esac
-done
 EOF'
 
 # 设置可执行权限
 sudo chmod +x /usr/local/bin/sb
 
-# 添加 alias
-if ! grep -q "alias sb=" ~/.bashrc; then
-    echo "alias sb='/usr/local/bin/sb'" >> ~/.bashrc
-fi
-source ~/.bashrc
-
-green "✅ 安装完成！登录 VPS 后直接输入 sb 调出 MTProto 面板"
+green "✅ 安装完成！MTProto 后端和监控已启动，面板文件保留，可手动运行 sb"
 }
 
 # -------------------------------
