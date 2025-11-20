@@ -1,101 +1,157 @@
 #!/bin/bash
 
-echo "=== MTProxy + FakeTLS + 优化 一键安装脚本 | Debian 12 ==="
+clear
+echo "============================================="
+echo " Telegram 动态北京时间昵称 更新器 一键部署脚本"
+echo "============================================="
 
-# 更新系统
-apt update -y
-apt install git curl build-essential openssl -y
+# ==== 获取 API 信息 ====
+echo
+read -p "请输入 Telegram API_ID: " TG_API_ID
+read -p "请输入 Telegram API_HASH: " TG_API_HASH
 
-cd /root
+# ==== 创建运行目录 ====
+INSTALL_DIR="$HOME/tg_name_clock"
+mkdir -p $INSTALL_DIR
 
-# 下载 MTProxy
-if [ ! -d "/root/MTProxy" ]; then
-    git clone https://github.com/TelegramMessenger/MTProxy
-fi
+echo
+echo "📁 创建目录: $INSTALL_DIR"
 
-cd MTProxy || exit
+# ==== 写入 Python 主程序 ====
+cat > $INSTALL_DIR/tg_name_clock.py << 'EOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# 编译
-make
+import os
+import re
+import asyncio
+import logging
+from datetime import datetime
 
-# 生成 Secret
-SECRET=$(head -c 16 /dev/urandom | xxd -ps)
-FAKETLS_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
-# FakeTLS 伪装域名（可换 apple.com / cloudflare.com）
-FAKETLS_DOMAIN="www.microsoft.com"
+from telethon import TelegramClient, errors
+from telethon.tl.functions.account import UpdateProfileRequest
 
-# 获取公网IP
-SERVER_IP=$(curl -s ipv4.icanhazip.com)
+# ========= 配置 =========
+CHECK_INTERVAL = 5
+TIMEZONE = "Asia/Shanghai"
 
-echo "生成的普通 Secret: $SECRET"
-echo "生成的 FakeTLS Secret: $FAKETLS_SECRET"
-echo "使用伪装域名: $FAKETLS_DOMAIN"
+api_id = int(os.getenv("TG_API_ID", "0"))
+api_hash = os.getenv("TG_API_HASH", "")
+session_name = "tg_time_session"
 
-# 创建 systemd 服务（优化版）
-cat >/etc/systemd/system/mtproxy.service <<EOF
-[Unit]
-Description=MTProxy with FakeTLS (Optimized)
-After=network.target
+if not api_id or not api_hash:
+    raise SystemExit("环境变量 TG_API_ID 或 TG_API_HASH 未设置！")
 
-[Service]
-Type=simple
-WorkingDirectory=/root/MTProxy
-ExecStart=/root/MTProxy/objs/bin/mtproto-proxy \\
-  -u nobody \\
-  -p 8888 \\
-  -H 443 \\
-  --aes-pwd proxy-secret proxy-multi.conf \\
-  -S ${SECRET} \\
-  --fake-tls ${FAKETLS_DOMAIN} \\
-  -P ${FAKETLS_SECRET} \\
-  -M 4 \\
-  --log-file /var/log/mtproxy.log \\
-  --max-special-connections 2048
-Restart=always
-LimitNOFILE=1000000
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("tg-clock")
 
-[Install]
-WantedBy=multi-user.target
+TIME_TAIL_RE = re.compile(r"\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: [\u2600-\U0001FAFF])?$")
+
+CLOCKS = [
+    "🕛", "🕧", "🕐", "🕜", "🕑", "🕝", "🕒", "🕞",
+    "🕓", "🕟", "🕔", "🕠", "🕕", "🕡", "🕖", "🕢",
+    "🕗", "🕣", "🕘", "🕤", "🕙", "🕥", "🕚", "🕦"
+]
+
+def clock_for(hour: int, minute: int) -> str:
+    idx = (hour % 12) * 2 + (1 if minute >= 30 else 0)
+    return CLOCKS[idx]
+
+client = TelegramClient(session_name, api_id, api_hash)
+
+async def change_name_loop():
+    me = await client.get_me()
+    original_first = me.first_name or ""
+    original_last = me.last_name or ""
+
+    tz = ZoneInfo(TIMEZONE)
+    last_time_str = ""
+
+    try:
+        while True:
+            now = datetime.now(tz)
+            time_str = now.strftime("%Y-%m-%d %H:%M")
+
+            if time_str != last_time_str:
+                emoji = clock_for(now.hour, now.minute)
+                me = await client.get_me()
+
+                base = re.sub(TIME_TAIL_RE, "", me.first_name or "").strip()
+                new_name = f"{base} {time_str} {emoji}"
+
+                try:
+                    await client(UpdateProfileRequest(first_name=new_name, last_name=""))
+                    logger.info(f"Updated: {new_name}")
+                    last_time_str = time_str
+                except errors.FloodWaitError as e:
+                    logger.warning(f"FloodWait: 等待 {e.seconds}s")
+                    await asyncio.sleep(e.seconds)
+                    continue
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    except asyncio.CancelledError:
+        logger.info("恢复原昵称…")
+        await client(UpdateProfileRequest(
+            first_name=original_first, last_name=original_last
+        ))
+        raise
+
+async def main():
+    await client.start()
+    task = asyncio.create_task(change_name_loop())
+    try:
+        await task
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        task.cancel()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 EOF
 
-# 系统参数优化 sysctl
-cat >>/etc/sysctl.conf <<EOF
-fs.file-max = 2000000
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.netdev_max_backlog = 250000
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.core.somaxconn = 1024
+echo "✅ Python 主程序已生成"
+
+# ==== 写入环境变量 ====
+echo
+echo "🔧 写入环境变量…"
+
+cat > $INSTALL_DIR/env.sh << EOF
+export TG_API_ID=$TG_API_ID
+export TG_API_HASH=$TG_API_HASH
 EOF
 
-sysctl -p
+echo "source \$HOME/tg_name_clock/env.sh" >> $HOME/.bashrc
 
-# 文件句柄数优化
-cat >>/etc/security/limits.conf <<EOF
-* soft nofile 1000000
-* hard nofile 1000000
-EOF
+# ==== 安装依赖 ====
+echo
+echo "📦 安装 Python 依赖…"
+sudo apt update -y >/dev/null 2>&1
+sudo apt install -y python3 python3-pip python3-venv >/dev/null 2>&1
 
-# 启动 MTProxy
-systemctl daemon-reload
-systemctl enable mtproxy
-systemctl restart mtproxy
+python3 -m pip install --upgrade pip >/dev/null 2>&1
+python3 -m pip install telethon backports.zoneinfo >/dev/null 2>&1
+
+echo "✅ 依赖安装完成"
+
+# ==== 启动脚本 ====
+echo
+echo "🚀 启动 Telegram 昵称自动更新时间脚本…"
+
+source $INSTALL_DIR/env.sh
+
+nohup python3 $INSTALL_DIR/tg_name_clock.py > $INSTALL_DIR/run.log 2>&1 &
 
 echo
-echo "=== MTProxy + FakeTLS 已成功安装并优化完成 ==="
-echo "服务器 IP: $SERVER_IP"
-echo "端口: 443"
-echo
-echo "🔹 普通代理链接："
-echo "tg://proxy?server=${SERVER_IP}&port=443&secret=${SECRET}"
-echo
-echo "🔹 FakeTLS 高级代理链接（推荐）："
-echo "tg://proxy?server=${SERVER_IP}&port=443&secret=dd${FAKETLS_SECRET}${SECRET}"
-echo
-echo "MTProxy 已自动开机启动。"
-echo "日志位置：/var/log/mtproxy.log"
-echo
+echo "============================================="
+echo " 部署完成！你的昵称会自动显示北京时间和动态时钟表情"
+echo "============================================="
+echo "后台运行日志: $INSTALL_DIR/run.log"
+echo "停止脚本命令: pkill -f tg_name_clock.py"
+echo "重启脚本命令: nohup python3 $INSTALL_DIR/tg_name_clock.py > $INSTALL_DIR/run.log 2>&1 &"
+echo "============================================="
